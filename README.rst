@@ -1,9 +1,13 @@
 icontract-hypothesis
 ====================
 
-.. image:: https://github.com/mristin/icontract-hypothesis/workflows/Test/badge.svg
-    :target: https://github.com/mristin/icontract-hypothesis/actions?query=workflow%3ATest
+.. image:: https://github.com/mristin/icontract-hypothesis/workflows/Test-on-push-to-main/badge.svg
+    :target: https://github.com/mristin/icontract-hypothesis/actions?query=workflow%3ATest-on-push-to-main
     :alt: Test
+
+.. image:: https://coveralls.io/repos/github/mristin/icontract-hypothesis/badge.svg?branch=main
+    :target: https://coveralls.io/github/mristin/icontract-hypothesis?branch=main
+    :alt: Test coverage
 
 .. image:: https://badge.fury.io/py/icontract-hypothesis.svg
     :target: https://badge.fury.io/py/icontract-hypothesis
@@ -30,8 +34,9 @@ You can use icontract-hypothesis:
 
 * As a library, to write succinct unit tests,
 * As a command-line tool or as a tool integrated in your IDE
-  (*e.g.*, `icontract-hypothesis-vim <https://github.com/mristin/icontract-hypothesis-vim>`__
-  and `icontract-hypothesis-pycharm <https://github.com/mristin/icontract-hypothesis-pycharm>`__).
+  (*e.g.*, `icontract-hypothesis-vim <https://github.com/mristin/icontract-hypothesis-vim>`__,
+  `icontract-hypothesis-pycharm <https://github.com/mristin/icontract-hypothesis-pycharm>`__ and
+  `icontract-hypothesis-vscode <https://github.com/mristin/icontract-hypothesis-vscode>`__).
 
   This allows you to automatically test functions during the development and
   use it in your continuous integration,
@@ -188,15 +193,24 @@ that generates a first draft based on pre-conditions that you manually refine fu
 .. Help starts: pyicontract-hypothesis ghostwrite --help
 .. code-block::
 
-    usage: pyicontract-hypothesis ghostwrite [-h] -m MODULE [-o OUTPUT]
-                                             [--explicit] [--bare]
+    usage: pyicontract-hypothesis ghostwrite [-h] (-m MODULE | -p PATH)
+                                             [-o OUTPUT] [--explicit] [--bare]
                                              [-i [INCLUDE [INCLUDE ...]]]
                                              [-e [EXCLUDE [EXCLUDE ...]]]
 
     optional arguments:
       -h, --help            show this help message and exit
       -m MODULE, --module MODULE
-                            Module to process
+                            Module to ghostwrite the unit tests for
+      -p PATH, --path PATH  Path to the module to ghostwrite the unit tests for.
+
+                            If the file represents a module reachable through
+                            sys.path, use the qualified module name in
+                            the unit test.
+
+                            Otherwise, the module is represented as the stem
+                            of the path with all non-identifier characters
+                            replaced with an underscore ("_").
       -o OUTPUT, --output OUTPUT
                             Path to the file where the output should be written.
 
@@ -347,6 +361,8 @@ IDE Plug-ins
   `VIM <https://www.vim.org/>`_
 * `icontract-hypothesis-pycharm <https://github.com/mristin/icontract-hypothesis-pycharm>`__ for
   `PyCharm <https://www.jetbrains.com/pycharm/>`_
+* `icontract-hypothesis-vscode <https://github.com/mristin/icontract-hypothesis-vscode>`__ for
+  `Visual Studio Code <https://code.visualstudio.com/>`_
 
 Related Libraries
 -----------------
