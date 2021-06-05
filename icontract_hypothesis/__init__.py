@@ -9,7 +9,6 @@ You need to install ``hypothesis`` extras in order to use this module.
 # pylint: disable=too-many-lines
 
 import ast
-import copy
 import datetime
 import decimal
 import dis
@@ -41,8 +40,8 @@ from typing import (
 import hypothesis.errors
 import hypothesis.internal.reflection
 import hypothesis.strategies
-import hypothesis.strategies._internal.types
 import hypothesis.strategies._internal.collections
+import hypothesis.strategies._internal.types
 import icontract._checkers
 import icontract._metaclass
 import icontract._recompute
@@ -50,9 +49,9 @@ import icontract._represent
 import icontract._types
 
 # Don't forget to update the version in setup.py!
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 __author__ = "Marko Ristin"
-__copyright__ = "Copyright 2020 Marko Ristin"
+__copyright__ = "Copyright 2020-2021 Marko Ristin"
 __license__ = "MIT"
 __status__ = "Production/Stable"
 
@@ -185,7 +184,7 @@ def _recompute(condition: Callable[..., Any], node: ast.expr) -> Tuple[Any, bool
     """Recompute the value corresponding to the node."""
     recompute_visitor = icontract._recompute.Visitor(
         variable_lookup=icontract._represent.collect_variable_lookup(
-            condition=condition, condition_kwargs=None
+            condition=condition, resolved_kwargs=None
         )
     )
 
@@ -791,11 +790,24 @@ def _infer_strategy_for_argument(
     return strategy
 
 
-def _rewrite_condition_as_filter(
+# fmt: off
+@icontract.ensure(
+    lambda result:
+    hasattr(result, "__icontract_hypothesis_source_code__"),
+    "The attribute is available (we depend on monkey-patching Hypothesis reflection function)"
+)
+@icontract.ensure(
+    lambda result:
+    result.__name__ == "<lambda>",
+    "Condition-as-filter-function is lambda "
+    "(even in cases where it calls a function as it is rewritten)"
+)
+# fmt: on
+def _rewrite_condition_as_filter_on_kwargs(
     contract: icontract._types.Contract,
 ) -> Callable[..., Any]:
     """
-    Parses, rewrites and recompiles the condition so that it can be used as filter on kwargs.
+    Parse, rewrite and recompile the condition so that it can be used as filter on kwargs.
 
     Return (rewritten condition as filter function, string representation of the condition)
     """
@@ -1101,9 +1113,16 @@ def _rewrite_condition_as_filter(
 
 
 def _infer_strategy_from_conjunction(
-    type_hints: Mapping[str, Any], conjunction: List[icontract._types.Contract]
+    type_hints: Mapping[str, Any],
+    conjunction: List[icontract._types.Contract],
+    self_instance: Optional[Any],
 ) -> hypothesis.strategies.SearchStrategy[Any]:
-    """Infer the strategy that satisfies the given conjunction of contracts."""
+    """
+    Infer the strategy that satisfies the given conjunction of contracts.
+
+    If ``self_instance`` has been specified, it is included as 'self' in the initial
+    fixed dictionary of strategies.
+    """
     ##
     # Group single-argument contracts by the argument,
     # keep the list of the zero or multi-argument contracts
@@ -1129,44 +1148,80 @@ def _infer_strategy_from_conjunction(
         else:
             non_single_argument_contracts.append(contract)
 
-    strategy = hypothesis.strategies.fixed_dictionaries(
-        {
-            arg_name: _infer_strategy_for_argument(
-                arg_name=arg_name,
-                type_hint=type_hint,
-                contracts=single_argument_contracts.get(arg_name, None),
+    if self_instance is not None and "self" in type_hints:
+        raise AssertionError(
+            f"Unexpected 'self' in ``type_hints`` {type_hints!r} "
+            f"while ``self_instance`` is given as {self_instance}. "
+            f"We expected 'self' to be removed from type hints in this case."
+        )
+
+    mapping = {
+        arg_name: _infer_strategy_for_argument(
+            arg_name=arg_name,
+            type_hint=type_hint,
+            contracts=single_argument_contracts.get(arg_name, None),
+        )
+        for arg_name, type_hint in type_hints.items()
+    }
+
+    if self_instance is not None and "self" in mapping:
+        raise AssertionError(
+            f"Unexpected 'self' in mapping of initial strategies {mapping!r} "
+            f"while ``self_instance`` is given as {self_instance}."
+        )
+
+    if self_instance is not None:
+        # The contracts on ``self`` will be handled in a special way, see below.
+        mapping["self"] = hypothesis.strategies.just(self_instance)
+
+    strategy = hypothesis.strategies.fixed_dictionaries(mapping)
+
+    # We need to chain contracts on ``self`` *after* the initial dictionary as Hypothesis
+    # optimizes away ``.filter`` on ``just`` strategy in representation (though the filtering
+    # is actually performed).
+    #
+    # See https://github.com/HypothesisWorks/hypothesis/pull/2688 (code) and
+    # https://github.com/HypothesisWorks/hypothesis/issues/2036 (issue) and
+    # https://github.com/HypothesisWorks/hypothesis/issues/2964 (issue).
+    if self_instance is not None and "self" in single_argument_contracts:
+        for contract in single_argument_contracts["self"]:
+            strategy = strategy.filter(
+                _rewrite_condition_as_filter_on_kwargs(contract=contract)
             )
-            for arg_name, type_hint in type_hints.items()
-        }
-    )
 
     for contract in non_single_argument_contracts:
-        condition_as_filter = _rewrite_condition_as_filter(contract=contract)
-
-        # Assert these attributes here as we depend on monkey patching the Hypothesis
-        # reflection function
-        assert hasattr(condition_as_filter, "__icontract_hypothesis_source_code__")
-        assert condition_as_filter.__name__ == "<lambda>", condition_as_filter.__name__
-
-        strategy = strategy.filter(condition_as_filter)
+        strategy = strategy.filter(
+            _rewrite_condition_as_filter_on_kwargs(contract=contract)
+        )
 
     return strategy
 
 
 def _create_strategy_only_from_type_hints(
-    type_hints: Mapping[str, Any]
+    type_hints: Mapping[str, Any], self_instance: Optional[Any]
 ) -> hypothesis.strategies.SearchStrategy[Any]:
     """
     Create a strategy based only on type hints.
 
     For example, this is the strategy that you can infer if there are no preconditions.
+
+    If ``self_instance`` is specified, it is included as a single-example strategy for 'self'.
     """
-    return hypothesis.strategies.fixed_dictionaries(
-        {
-            arg_name: hypothesis.strategies.from_type(arg_type)
-            for arg_name, arg_type in type_hints.items()
-        }
-    )
+    mapping = {
+        arg_name: hypothesis.strategies.from_type(arg_type)
+        for arg_name, arg_type in type_hints.items()
+    }
+
+    if self_instance is not None and "self" in mapping:
+        raise AssertionError(
+            f"Unexpected 'self' in strategy mapping {mapping!r} "
+            f"while self_instance has been specified: {self_instance}"
+        )
+
+    if self_instance is not None:
+        mapping["self"] = hypothesis.strategies.just(self_instance)
+
+    return hypothesis.strategies.fixed_dictionaries(mapping)
 
 
 def infer_strategy(
@@ -1199,7 +1254,7 @@ def infer_strategy(
     "fixed_dictionaries({'x': integers(min_value=1)})"
     """
     parameters = inspect.signature(func).parameters
-    if len(parameters) == 0:
+    if len(parameters) == 0 and not hasattr(func, "__self__"):
         return hypothesis.strategies.just(dict())
 
     for name, parameter in parameters.items():
@@ -1213,20 +1268,36 @@ def infer_strategy(
         else:
             pass
 
-    type_hints = typing.get_type_hints(func, localns=localns)
+    type_hints = typing.get_type_hints(func, localns=localns, globalns=globalns)
     if "return" in type_hints:
         del type_hints["return"]
 
     parameter_set = set(parameters.keys())
-    parameter_set.difference_update({"self"})
+
+    # We need to take special care when handling the bound methods whose contracts involve 'self'.
+    if hasattr(func, "__self__") and "self" in parameter_set:
+        parameter_set.remove("self")
+
+        if "self" in type_hints:
+            del type_hints["self"]
+
+    if "self" in parameter_set and func.__name__ == "__init__":
+        # The self instance does not exist yet in the __init__ so we can not generate it and
+        # can safely remove it from the parameters.
+        parameter_set.remove("self")
+
+        if "self" in type_hints:
+            del type_hints["self"]
 
     # If the class specifies its own ``__new__`` we have to remove the first parameter corresponding
     # to the class from the list of parameters. Python will supply it by convention.
     #
     # However, in case of ``object.__new__``, there is no ``cls`` as the first argument!
     #
-    # pylint: disable=comparison-with-callable
-    if func.__name__ == "__new__" and func != object.__new__:
+    elif (
+        func.__name__ == "__new__"
+        and func != object.__new__  # pylint: disable=comparison-with-callable
+    ):
         if len(parameters.keys()) > 0:
             # Remove the first parameter which points to the class.
             #
@@ -1238,6 +1309,24 @@ def infer_strategy(
 
             if cls_parameter in type_hints:
                 del type_hints[cls_parameter]
+
+    elif (
+        not hasattr(func, "__self__")
+        and "self" in parameters
+        and "self" not in type_hints
+        and inspect.isfunction(func)
+    ):
+        # This might be an unbound instance method.
+        # There is no way in Python 3 how we can directly figure out the class of an unbound
+        # method, so we try to hack our way through using ``__qualname__``.
+        #
+        # See https://stackoverflow.com/questions/3589311/get-defining-class-of-unbound-method-object-in-python-3
+        if ".<locals>." not in func.__qualname__:
+            parts = func.__qualname__.rsplit(".", 1)
+            if len(parts) >= 2:
+                maybe_cls = getattr(inspect.getmodule(func), parts[0], None)
+                if inspect.isclass(maybe_cls):
+                    type_hints["self"] = maybe_cls
 
     typed_args = set(type_hints)
 
@@ -1257,14 +1346,22 @@ def infer_strategy(
         raise TypeError(
             (
                 "No search strategy could be inferred for the function: {}; "
-                "the following arguments are missing the type annotations: {}"
-            ).format(func, list(parameter_set.difference(typed_args)))
+                "the following arguments are missing the type annotations: {};\n\n"
+                "sorted typed_args was {}, sorted parameter_set was {}"
+            ).format(
+                func,
+                list(parameter_set.difference(typed_args)),
+                sorted(typed_args),
+                sorted(parameter_set),
+            )
         )
 
     checker = icontract._checkers.find_checker(func)
 
     if checker is None:
-        return _create_strategy_only_from_type_hints(type_hints=type_hints)
+        return _create_strategy_only_from_type_hints(
+            type_hints=type_hints, self_instance=getattr(func, "__self__", None)
+        )
 
     maybe_preconditions = getattr(checker, "__preconditions__", None)
 
@@ -1281,10 +1378,16 @@ def infer_strategy(
         preconditions = cast(List[List[icontract._types.Contract]], maybe_preconditions)
 
     if preconditions is None or len(preconditions) == 0:
-        return _create_strategy_only_from_type_hints(type_hints=type_hints)
+        return _create_strategy_only_from_type_hints(
+            type_hints=type_hints, self_instance=getattr(func, "__self__", None)
+        )
 
     strategies = [
-        _infer_strategy_from_conjunction(type_hints=type_hints, conjunction=conjunction)
+        _infer_strategy_from_conjunction(
+            type_hints=type_hints,
+            conjunction=conjunction,
+            self_instance=getattr(func, "__self__", None),
+        )
         for conjunction in preconditions
     ]
 
@@ -1294,9 +1397,18 @@ def infer_strategy(
     return hypothesis.strategies.one_of(strategies)
 
 
-def test_with_inferred_strategy(func: CallableT) -> None:
+def test_with_inferred_strategy(
+    func: CallableT,
+    localns: Optional[Dict[str, Any]] = None,
+    globalns: Optional[Dict[str, Any]] = None,
+) -> None:
     r"""
     Use type hints and contracts to infer the search strategy and test the function.
+
+    You need to supply ``localns`` and ``globalns``, the local namespace and the global namespace
+    of the function, respectively, in case there are forward references which can not be
+    automatically resolved. For example, if you have nested classes and functions.
+    See PEP 563 and the bug reports related to ``typing.get_type_hints`` for more details.
 
     Here is an example test case which tests a function ``some_func``:
 
@@ -1318,10 +1430,17 @@ def test_with_inferred_strategy(func: CallableT) -> None:
     """
     pass  # for pydocstyle
 
-    def execute(kwargs: Dict[str, Any]) -> None:
-        func(**kwargs)
+    # Since ``self`` is already included in the strategy, we have to unbind the ``func``.
+    # Please see ``infer_strategy`` function and how it deals with ``self_instance``.
+    func_to_execute = func
+    if hasattr(func, "__self__"):
+        func_to_execute = func.__func__  # type: ignore
 
-    strategy = infer_strategy(func=func)
+    strategy = infer_strategy(func=func, localns=localns, globalns=globalns)
+
+    def execute(kwargs: Dict[str, Any]) -> None:
+        func_to_execute(**kwargs)
+
     wrapped = hypothesis.given(strategy)(execute)
     wrapped()
 
