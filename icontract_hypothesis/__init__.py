@@ -24,6 +24,7 @@ from typing import (
     TypeVar,
     Callable,
     Any,
+    Generic,
     List,
     Mapping,
     MutableMapping,
@@ -49,7 +50,7 @@ import icontract._represent
 import icontract._types
 
 # Don't forget to update the version in setup.py!
-__version__ = "1.1.3"
+__version__ = "1.1.5"
 __author__ = "Marko Ristin"
 __copyright__ = "Copyright 2020-2021 Marko Ristin"
 __license__ = "MIT"
@@ -102,7 +103,7 @@ def make_assume_preconditions(func: CallableT) -> Callable[..., None]:
         return _assume_preconditions_always_satisfied
 
     preconditions = getattr(checker, "__preconditions__", None)
-    if preconditions is None:
+    if preconditions is None or len(preconditions) == 0:
         return _assume_preconditions_always_satisfied
 
     sign = inspect.signature(func)
@@ -311,9 +312,9 @@ def _infer_min_max_from_node(
             ):
                 return _InferredMinMax(
                     min_value=right_value,
-                    min_inclusive=isinstance(op0, ast.GtE),
+                    min_inclusive=isinstance(op1, ast.GtE),
                     max_value=left_value,
-                    max_inclusive=isinstance(op1, ast.GtE),
+                    max_inclusive=isinstance(op0, ast.GtE),
                 )
 
             # We could not infer any bound from this condition.
@@ -366,7 +367,9 @@ def _infer_min_max_from_preconditions(
     Return the contracts which could not be interpreted.
     """
     min_value = None  # type: Optional[Union[int, float]]
+    min_inclusive = False
     max_value = None  # type: Optional[Union[int, float]]
+    max_inclusive = False
 
     remaining_contracts = []  # type: List[icontract._types.Contract]
 
@@ -388,30 +391,48 @@ def _infer_min_max_from_preconditions(
                 # This might be a bit counter-intuitive at the first sight.
 
                 if inferred.min_value is not None:
-                    min_value = (
-                        inferred.min_value
-                        if min_value is None
-                        else max(inferred.min_value, min_value)
-                    )
+                    if min_value is None:
+                        min_value = inferred.min_value
+                        min_inclusive = inferred.min_inclusive
+                    else:
+                        if inferred.min_value > min_value:
+                            min_value = inferred.min_value
+                            min_inclusive = inferred.min_inclusive
+                        else:
+                            # Current min is already the correct lower bound.
+                            pass
 
                 if inferred.max_value is not None:
-                    max_value = (
-                        inferred.max_value
-                        if max_value is None
-                        else min(inferred.max_value, max_value)
-                    )
+                    if max_value is None:
+                        max_value = inferred.max_value
+                        max_inclusive = inferred.max_inclusive
+                    else:
+                        if inferred.max_value < max_value:
+                            max_value = inferred.max_value
+                            max_inclusive = inferred.max_inclusive
+                        else:
+                            # Current max is already the correct upper bound.
+                            pass
 
-                # We can not have exclusive bounds on Fractions and Decimals, so we need to leave
-                # the contracts in place.
-                if type_hint in [fractions.Fraction, decimal.Decimal]:
-                    remaining_contracts.append(contract)
+                if (inferred.max_value is not None and not inferred.max_inclusive) or (
+                    inferred.min_value is not None and not inferred.min_inclusive
+                ):
+                    # We can not have exclusive bounds on Fractions and Decimals,
+                    # so we need to leave the contracts in place to filter out these edge cases.
+                    if type_hint in [fractions.Fraction, decimal.Decimal]:
+                        remaining_contracts.append(contract)
             else:
                 remaining_contracts.append(contract)
         else:
             remaining_contracts.append(contract)
 
     return (
-        _InferredMinMax(min_value=min_value, max_value=max_value),
+        _InferredMinMax(
+            min_value=min_value,
+            max_value=max_value,
+            min_inclusive=min_inclusive,
+            max_inclusive=max_inclusive,
+        ),
         remaining_contracts,
     )
 
@@ -430,10 +451,15 @@ def _make_strategy_with_min_max_for_type(
         if max_value is not None and not inferred.max_inclusive:
             max_value -= 1
 
-        strategy = hypothesis.strategies.integers(
-            min_value=min_value,
-            max_value=max_value,
-        )  # type: hypothesis.strategies.SearchStrategy[Any]
+        if min_value is not None and min_value == max_value:
+            strategy = hypothesis.strategies.just(
+                min_value
+            )  # type: hypothesis.strategies.SearchStrategy[Any]
+        else:
+            strategy = hypothesis.strategies.integers(
+                min_value=min_value,
+                max_value=max_value,
+            )
 
     elif a_type == float:
         strategy = hypothesis.strategies.floats(
@@ -563,9 +589,18 @@ def _make_strategy_with_min_max_for_type(
 _DUMMY_RE = re.compile(r"something")
 
 
+class PatternInCondition(Generic[AnyStr]):
+    """Represent a pattern that defines the contract condition."""
+
+    def __init__(self, pattern: Pattern[AnyStr], fullmatch: bool) -> None:
+        """Initialize with the given values."""
+        self.pattern: Pattern[AnyStr] = pattern
+        self.fullmatch = fullmatch
+
+
 def _infer_regexp_from_condition(
     arg_name: str, condition: Callable[..., Any]
-) -> Optional[Pattern[AnyStr]]:
+) -> Optional[PatternInCondition[AnyStr]]:
     """Try to infer the regular expression pattern from a precondition."""
     body_node = _body_node_from_condition(condition=condition)
     if body_node is None:
@@ -580,7 +615,12 @@ def _infer_regexp_from_condition(
     if not isinstance(body_node.func, ast.Attribute):
         return None
 
-    if body_node.func.attr != "match":
+    if body_node.func.attr == "match":
+        fullmatch = False
+    elif body_node.func.attr == "fullmatch":
+        fullmatch = True
+    else:
+        # This is neither ``re.match`` nor ``re.fullmatch`` function.
         return None
 
     callee, recomputed = _recompute(condition=condition, node=body_node.func.value)
@@ -620,10 +660,10 @@ def _infer_regexp_from_condition(
                 kwargs[keyword.arg] = value
 
             pattern = re.compile(*args, **kwargs)
-            return pattern
+            return PatternInCondition(pattern=pattern, fullmatch=fullmatch)
 
     elif isinstance(callee, Pattern):
-        return callee
+        return PatternInCondition(pattern=callee, fullmatch=fullmatch)
 
     return None
 
@@ -647,63 +687,26 @@ def _infer_str_strategy_from_preconditions(
     Return (strategy if possible, remaining contracts).
     """
     found_idx = -1  # Index of the contract that defines the pattern, -1 if not found
-    re_pattern = None  # type: Optional[Pattern[AnyStr]]
+    pattern_in_condition = None  # type: Optional[PatternInCondition[AnyStr]]
 
     for i, contract in enumerate(contracts):
-        re_pattern = _infer_regexp_from_condition(
+        pattern_in_condition = _infer_regexp_from_condition(
             arg_name=arg_name, condition=contract.condition
         )
-        if re_pattern is not None:
+        if pattern_in_condition is not None:
             found_idx = i
             break
 
     if found_idx == -1:
         return None, contracts[:]
 
-    assert re_pattern is not None
+    assert pattern_in_condition is not None
     return (
-        hypothesis.strategies.from_regex(regex=re_pattern),
+        hypothesis.strategies.from_regex(
+            regex=pattern_in_condition.pattern, fullmatch=pattern_in_condition.fullmatch
+        ),
         contracts[:found_idx] + contracts[found_idx + 1 :],
     )
-
-
-def _strategy_for_type(
-    a_type: Type[T],
-) -> hypothesis.strategies.SearchStrategy[T]:
-    """Create a strategy for instances to satisfy the preconditions on ``__init__``."""
-    init = getattr(a_type, "__init__")
-
-    if inspect.isfunction(init):
-        strategy = infer_strategy(init)
-    elif isinstance(init, icontract._checkers._SLOT_WRAPPER_TYPE):
-        # We have to distinguish this special case which is used by named tuples and
-        # possibly other optimized data structures.
-        # In those cases, we have to infer the strategy based on __new__ instead of __init__.
-        new = getattr(a_type, "__new__")
-        assert (
-            new is not None
-        ), "Expected __new__ in {} if __init__ is a slot wrapper.".format(a_type)
-
-        # Add a local namespace in case there are forward references (which is usually the case for
-        # the return value).
-        #
-        # In particular, the class is not available in the module while we are
-        # registering it through the ``icontract.DBCMeta`` meta-class as its loading is still
-        # in progress.
-        strategy = infer_strategy(new, localns={a_type.__name__: a_type})
-    else:
-        raise AssertionError(
-            "Expected __init__ to be either a function or a slot wrapper, but got: {}".format(
-                type(init)
-            )
-        )
-
-    pack_repr = f"lambda d: {a_type.__name__}(**d)"
-
-    pack = lambda d: a_type(**d)  # type: ignore
-    pack.__icontract_hypothesis_source_code__ = pack_repr  # type: ignore
-
-    return strategy.map(pack=pack)
 
 
 @icontract.require(
@@ -1275,8 +1278,11 @@ def infer_strategy(
     parameter_set = set(parameters.keys())
 
     # We need to take special care when handling the bound methods whose contracts involve 'self'.
-    if hasattr(func, "__self__") and "self" in parameter_set:
-        parameter_set.remove("self")
+    if hasattr(func, "__self__"):
+        assert "self" not in parameter_set, (
+            f"Unexpected ``self`` in the parameter set when ``__self__`` was set "
+            f"on the function {func}; the parameter set was: {parameter_set}"
+        )
 
         if "self" in type_hints:
             del type_hints["self"]
@@ -1447,7 +1453,7 @@ def test_with_inferred_strategy(
 
 def _register_with_hypothesis(cls: Type[T]) -> None:
     """
-    Register ``cls`` with Hypothesis based on our custom ``_strategy_for_type``.
+    Register ``cls`` with Hypothesis based on the inferred strategy.
 
     The registration is necessary so that the preconditions on the __init__ are propagated
     in ``hypothesis.strategies.builds``.
@@ -1459,8 +1465,62 @@ def _register_with_hypothesis(cls: Type[T]) -> None:
     if inspect.isabstract(cls) and getattr(cls, "__new__") == object.__new__:
         return
 
-    if cls not in hypothesis.strategies._internal.types._global_type_lookup:
-        hypothesis.strategies.register_type_strategy(cls, _strategy_for_type(cls))
+    if cls in hypothesis.strategies._internal.types._global_type_lookup:
+        # Do not re-register
+        return
+
+    init = getattr(cls, "__init__")
+
+    if inspect.isfunction(init):
+        # If there is is no checker nor pre-conditions on ``__init__``, we should simply delegate
+        # the case to Hypothesis and not register the strategy for this type.
+
+        checker = icontract._checkers.find_checker(init)
+        if checker is None:
+            return
+
+        maybe_preconditions = getattr(checker, "__preconditions__", None)
+        if maybe_preconditions is None or len(maybe_preconditions) == 0:
+            return
+
+        # We have to add the ``a_type`` itself to a local namespace for forward references.
+        #
+        # This is needed if we register a class through the ``icontract.DBCMeta``
+        # meta-class where it references itself. For example, a node in a linked list.
+
+        strategy = infer_strategy(init, localns={cls.__name__: cls})
+
+    elif isinstance(init, icontract._checkers._SLOT_WRAPPER_TYPE):
+        # We have to distinguish this special case which is used by named tuples and
+        # possibly other optimized data structures.
+        # In those cases, we have to infer the strategy based on __new__ instead of __init__.
+        new = getattr(cls, "__new__")
+        assert (
+            new is not None
+        ), "Expected __new__ in {} if __init__ is a slot wrapper.".format(cls)
+
+        # We have to add the ``a_type`` itself to a local namespace for forward references.
+        # This is usually the case for the return value of ``__new__``.
+        #
+        # In particular, the class is not available in the module while we are
+        # registering it through the ``icontract.DBCMeta`` meta-class as its loading is still
+        # in progress.
+
+        strategy = infer_strategy(new, localns={cls.__name__: cls})
+    else:
+        raise AssertionError(
+            "Expected __init__ to be either a function or a slot wrapper, but got: {}".format(
+                type(init)
+            )
+        )
+
+    pack_repr = f"lambda d: {cls.__name__}(**d)"
+
+    pack = lambda d: cls(**d)  # type: ignore
+    pack.__icontract_hypothesis_source_code__ = pack_repr  # type: ignore
+
+    strategy = strategy.map(pack=pack)
+    hypothesis.strategies.register_type_strategy(custom_type=cls, strategy=strategy)
 
 
 def _hook_into_icontract_and_hypothesis() -> None:

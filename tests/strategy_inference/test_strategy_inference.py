@@ -11,7 +11,7 @@ import math
 import re
 import sys
 import unittest
-from typing import List, NamedTuple, Union, Optional, Any, Mapping, Sequence
+from typing import List, NamedTuple, Union, Optional, Any, Mapping, Sequence, cast, Type
 
 if sys.version_info >= (3, 8):
     from typing import TypedDict
@@ -19,6 +19,7 @@ if sys.version_info >= (3, 8):
 import hypothesis
 import hypothesis.strategies as st
 import hypothesis.errors
+import hypothesis.strategies._internal.types
 import icontract
 
 import icontract_hypothesis
@@ -49,9 +50,19 @@ class TestWithInferredStrategies(unittest.TestCase):
             str(type_error),
         )
 
-    def test_without_preconditions(self) -> None:
+    def test_without_contracts(self) -> None:
         def some_func(x: int) -> None:
             pass
+
+        strategy = icontract_hypothesis.infer_strategy(some_func)
+        self.assertEqual("fixed_dictionaries({'x': integers()})", str(strategy))
+
+        icontract_hypothesis.test_with_inferred_strategy(some_func)
+
+    def test_with_only_preconditions(self) -> None:
+        @icontract.ensure(lambda result: result > 0)
+        def some_func(x: int) -> int:
+            return 1
 
         strategy = icontract_hypothesis.infer_strategy(some_func)
         self.assertEqual("fixed_dictionaries({'x': integers()})", str(strategy))
@@ -251,6 +262,24 @@ fixed_dictionaries({'x': floats(), 'y': floats()}).filter(lambda d: SOME_CONSTAN
         )
 
         icontract_hypothesis.test_with_inferred_strategy(some_func)
+
+
+class SomeCyclicalGlobalClass(icontract.DBC):
+    """
+    Represent a class which has a cyclical dependency on itself.
+
+    For example, a node of a linked list.
+    """
+
+    value: int
+    next_node: Optional["SomeCyclicalGlobalClass"]
+
+    @icontract.require(lambda value: value > 0)
+    def __init__(
+        self, value: int, next_node: Optional["SomeCyclicalGlobalClass"]
+    ) -> None:
+        self.value = value
+        self.next_node = next_node
 
 
 # noinspection PyUnusedLocal
@@ -661,6 +690,65 @@ class TestWithInferredStrategiesOnClasses(unittest.TestCase):
 
         icontract_hypothesis.test_with_inferred_strategy(some_func)
 
+    def test_cyclical_data_structure(self) -> None:
+        def some_func(cyclical: SomeCyclicalGlobalClass) -> None:
+            pass
+
+        strategy = icontract_hypothesis.infer_strategy(some_func)
+
+        self.assertEqual(
+            "fixed_dictionaries({"
+            "'cyclical': fixed_dictionaries({"
+            "'next_node': one_of(none(), builds(SomeCyclicalGlobalClass)),\n"
+            "  'value': integers(min_value=1)}).map(lambda d: SomeCyclicalGlobalClass(**d))})",
+            str(strategy),
+        )
+
+        # We can not execute this strategy, as ``builds`` is not handling the recursivity well.
+        # Please see this Hypothesis issue:
+        # https://github.com/HypothesisWorks/hypothesis/issues/3026
+
+    def test_class_not_registered_if_no_contracts_on_init(self) -> None:
+        class A(icontract.DBC):
+            def __init__(self, x: int) -> None:
+                self.x = x
+
+        def some_func(a: A) -> None:
+            pass
+
+        assert A not in hypothesis.strategies._internal.types._global_type_lookup
+
+        strategy = icontract_hypothesis.infer_strategy(some_func)
+        self.assertEqual(
+            "fixed_dictionaries({'a': builds(A)})",
+            str(strategy),
+        )
+
+        icontract_hypothesis.test_with_inferred_strategy(some_func)
+
+    def test_class_not_registered_if_no_preconditions_on_init(self) -> None:
+        class A(icontract.DBC):
+            @icontract.ensure(lambda self: self.x % 2 == 0)
+            def __init__(self, x: int) -> None:
+                self.x = 2 * x
+
+        def some_func(a: A) -> None:
+            pass
+
+        assert A not in hypothesis.strategies._internal.types._global_type_lookup
+
+        strategy = icontract_hypothesis.infer_strategy(some_func)
+        self.assertEqual(
+            "fixed_dictionaries({'a': builds(A)})",
+            str(strategy),
+        )
+
+        # We can not execute the strategy as Hypothesis uses ``inspect.getfullargspec`` which
+        # does not work on decorated functions.
+        #
+        # See this Hypothesis issue: https://github.com/HypothesisWorks/hypothesis/issues/3029
+        # icontract_hypothesis.test_with_inferred_strategy(some_func)
+
 
 # noinspection PyUnusedLocal
 class TestRepresentationOfCondition(unittest.TestCase):
@@ -837,6 +925,35 @@ class TestSelf(unittest.TestCase):
 
         icontract_hypothesis.test_with_inferred_strategy(a.some_func)
 
+    def test_precondition_with_typed_self_argument(self) -> None:
+        class A(icontract.DBC):
+            def __init__(self) -> None:
+                self.x = 0
+
+            # noinspection PyShadowingNames
+            @icontract.require(lambda self: self.x >= 0)
+            def some_func(self: "A") -> None:
+                pass
+
+            def __repr__(self) -> str:
+                return "An instance of A"
+
+        a = A()
+
+        strategy = icontract_hypothesis.infer_strategy(
+            a.some_func, localns={A.__name__: A}
+        )
+        self.assertEqual(
+            "fixed_dictionaries({"
+            "'self': just(An instance of A)})"
+            ".filter(lambda d: d['self'].x >= 0)",
+            str(strategy),
+        )
+
+        icontract_hypothesis.test_with_inferred_strategy(
+            a.some_func, localns={A.__name__: A}
+        )
+
     def test_unsatisfiable_precondition_with_self_argument(self) -> None:
         class A(icontract.DBC):
             def __init__(self) -> None:
@@ -957,9 +1074,7 @@ class TestSelf(unittest.TestCase):
         self.assertEqual(
             "fixed_dictionaries({"
             "'number': integers(min_value=1),\n"
-            " 'self': fixed_dictionaries({})"
-            ".map(lambda d: A(**d))"
-            ".filter(lambda self: self.x >= 0)})",
+            " 'self': builds(A).filter(lambda self: self.x >= 0)})",
             str(strategy),
         )
 
@@ -971,7 +1086,7 @@ class TestSelf(unittest.TestCase):
         self.assertEqual(
             "fixed_dictionaries({"
             "'number': integers(min_value=1),\n"
-            " 'self': fixed_dictionaries({}).map(lambda d: SomeGlobalClass(**d))"
+            " 'self': builds(SomeGlobalClass)"
             ".filter(lambda self: self.x >= 0)})",
             str(strategy),
         )
@@ -985,12 +1100,56 @@ class TestSelf(unittest.TestCase):
 
         self.assertEqual(
             "fixed_dictionaries({'another_number': integers(min_value=1),\n"
-            " 'self': fixed_dictionaries({}).map(lambda d: SomeGlobalClassWithInheritance(**d))})",
+            " 'self': builds(SomeGlobalClassWithInheritance)})",
             str(strategy),
         )
 
         icontract_hypothesis.test_with_inferred_strategy(
             SomeGlobalClassWithInheritance.another_func
+        )
+
+
+class TestNew(unittest.TestCase):
+    def test_new_with_cast(self) -> None:
+        class PositiveInteger(icontract.DBC, int):
+            @icontract.require(lambda integer: integer > 0)
+            def __new__(cls, integer: int) -> "PositiveInteger":
+                return cast(PositiveInteger, integer)
+
+        def some_func(positive_integer: PositiveInteger) -> None:
+            pass
+
+        strategy = icontract_hypothesis.infer_strategy(some_func)
+        self.assertEqual(
+            "fixed_dictionaries({"
+            "'positive_integer': "
+            "fixed_dictionaries({"
+            "'integer': integers(min_value=1)})"
+            ".map(lambda d: PositiveInteger(**d))})",
+            str(strategy),
+        )
+
+        icontract_hypothesis.test_with_inferred_strategy(some_func)
+
+    def test_new_with_cls_typed(self) -> None:
+        class PositiveInteger(icontract.DBC, int):
+            @icontract.require(lambda integer: integer > 0)
+            def __new__(
+                cls: Type["PositiveInteger"], integer: int
+            ) -> "PositiveInteger":
+                return cast(PositiveInteger, integer)
+
+        def some_func(positive_integer: PositiveInteger) -> None:
+            pass
+
+        strategy = icontract_hypothesis.infer_strategy(some_func)
+        self.assertEqual(
+            "fixed_dictionaries({"
+            "'positive_integer': "
+            "fixed_dictionaries({"
+            "'integer': integers(min_value=1)})"
+            ".map(lambda d: PositiveInteger(**d))})",
+            str(strategy),
         )
 
 

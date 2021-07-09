@@ -1,9 +1,9 @@
 icontract-hypothesis
 ====================
 
-.. image:: https://github.com/mristin/icontract-hypothesis/workflows/Test-on-push-to-main/badge.svg
-    :target: https://github.com/mristin/icontract-hypothesis/actions?query=workflow%3ATest-on-push-to-main
-    :alt: Test
+.. image:: https://github.com/mristin/icontract-hypothesis/workflows/CI/badge.svg
+    :target: https://github.com/mristin/icontract-hypothesis/actions?query=workflow%3ACI
+    :alt: Continuous integration
 
 .. image:: https://coveralls.io/repos/github/mristin/icontract-hypothesis/badge.svg?branch=main
     :target: https://coveralls.io/github/mristin/icontract-hypothesis?branch=main
@@ -80,7 +80,9 @@ precondition:
     Traceback (most recent call last):
         ...
     icontract.errors.ViolationError: File <doctest README.rst[4]>, line 2 in <module>:
-    result > 0: result was -999
+    result > 0:
+    result was -999
+    x was 1
 
 The function ``assume_preconditions`` created by
 ``icontract_hypothesis.make_assume_preconditions`` will reject all the input
@@ -102,7 +104,9 @@ values which do not satisfy the pre-conditions of ``some_func``.
     Traceback (most recent call last):
         ...
     icontract.errors.ViolationError: File <doctest README.rst[10]>, line 2 in <module>:
-    result > 0: result was -999
+    result > 0:
+    result was -999
+    x was 1
 
 Which approach to use depends on how you want to write your tests.
 The first approach, using ``assume_preconditions``, is practical if you already
